@@ -1,0 +1,10 @@
+[package]
+name = "rcwd"
+version = "0.0.0"
+authors = ["Alexander 'z33ky' Hirsch <1zeeky@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+xcb = "0.8.2"
+byteorder = "1.0"
+dirs = "1.0"
