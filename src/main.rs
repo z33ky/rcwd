@@ -119,7 +119,7 @@ impl std::fmt::Display for Cwd {
     }
 }
 
-fn get_child_cwd<Str: PartialEq<str>>(pid: u32, priority_commands: &[Str]) -> Cwd {
+fn get_child_cwd<Str: PartialEq<str>>(pid: u32, priority_commands: &[Str]) -> Option<Cwd> {
     use std::io::Read;
 
     //find children
@@ -127,15 +127,40 @@ fn get_child_cwd<Str: PartialEq<str>>(pid: u32, priority_commands: &[Str]) -> Cw
     //get cwd
     //FIXME: potential race
     //       use openat?
-    let exe = std::fs::read_link(format!("/proc/{}/exe", pid)).expect("Unable to read /proc/$PID/exe").to_str().unwrap().to_owned();
-    let cwd = Cwd::new(std::fs::read_link(format!("/proc/{}/cwd", pid)).expect("Unable to read /proc/$PID/cwd").to_str().unwrap().into(), &exe, priority_commands);
+    let exe = match std::fs::read_link(format!("/proc/{}/exe", pid)) {
+        Ok(exe) => exe.to_str().unwrap().to_owned(),
+        Err(error) => {
+            eprintln!("Unable to read /proc/{}/exe: {}.", pid, error);
+            return None;
+        },
+    };
+    let cwd = match std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+        Ok(cwd) => Cwd::new(cwd.to_str().unwrap().to_owned(), &exe, priority_commands),
+        Err(error) => {
+            eprintln!("Unable to read /proc/{}/cwd: {}.", pid, error);
+            return None;
+        },
+    };
     //FIXME: tid
     let tid = pid;
-    std::fs::File::open(format!("/proc/{}/task/{}/children", pid, tid)).expect("Unable to read /proc/$PID/task/$PID/children").read_to_string(&mut children).unwrap();
+    match std::fs::File::open(format!("/proc/{}/task/{}/children", pid, tid)) {
+        Ok(mut file) => match file.read_to_string(&mut children) {
+            Ok(_) => (),
+            Err(error) => {
+                eprintln!("Unable to read from /proc/{}/task/{}/children: {}.", pid, tid, error);
+                return None;
+            },
+        },
+        Err(error) => {
+            eprintln!("Unable to read /proc/{}/task/{}/children: {}.", pid, tid, error);
+            return None;
+        },
+    }
     if children.is_empty() {
         //no children
-        return cwd;
+        return Some(cwd);
     }
+
     //get child cwd
     let mut children = children.split(' ');
     let child = children.next().unwrap();
@@ -143,19 +168,23 @@ fn get_child_cwd<Str: PartialEq<str>>(pid: u32, priority_commands: &[Str]) -> Cw
         //TODO: this isn't a problem if all children have the same cwd
         eprintln!("Warning: Process {} has multiple children. Following {}.", pid, child);
     }
-    let child_cwd = get_child_cwd(child.parse().unwrap(), priority_commands);
-    match (&cwd, &child_cwd) {
+    let child_cwd = match get_child_cwd(child.parse().unwrap(), priority_commands) {
+        Some(cwd) => cwd,
+        None => return Some(cwd),
+    };
+
+    Some(match (&cwd, &child_cwd) {
         //prefer child cwd
         (_, Cwd::Priority(_)) => child_cwd,
         (Cwd::Regular(_), Cwd::Regular(_)) => child_cwd,
         //unless cwd is prioritized
         (Cwd::Priority(_), Cwd::Regular(_)) => cwd,
-    }
+    })
 }
 
 fn main() {
     match get_focused_window_pid() {
-        Some(pid) => println!("{}", get_child_cwd(pid, &std::env::args().skip(1).collect::<Vec<_>>())),
+        Some(pid) => println!("{}", get_child_cwd(pid, &std::env::args().skip(1).collect::<Vec<_>>()).unwrap()),
         None => println!("{}", dirs::home_dir().unwrap().to_str().unwrap()),
     }
 }
