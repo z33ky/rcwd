@@ -6,7 +6,7 @@ enum X11WmState {
     Iconic    = 3,
 }
 
-fn get_focused_window_pid() -> std::option::Option<u32> {
+fn get_focused_window_pid() -> Option<u32> {
     //FIXME: X11 endianess?
     use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -29,7 +29,9 @@ fn get_focused_window_pid() -> std::option::Option<u32> {
 
     let active_window_atom = active_window_atom_cookie.get_reply().expect("Unable to retrieve _NET_ACTIVE_WINDOW atom").atom();
 
-    let reply = xcb::get_property(&conn, false, root, active_window_atom, xcb::ATOM_WINDOW, 0, 1).get_reply().expect("Unable to retrieve _NET_ACTIVE_WINDOW property from root");
+    let reply = xcb::get_property(&conn, false, root, active_window_atom, xcb::ATOM_WINDOW, 0, 1)
+                    .get_reply()
+                    .expect("Unable to retrieve _NET_ACTIVE_WINDOW property from root");
     if reply.value_len() == 0 {
         eprintln!("Unable to retrieve _NET_ACTIVE_WINDOW property from root");
         return None;
@@ -70,12 +72,17 @@ fn get_focused_window_pid() -> std::option::Option<u32> {
     //get pid
     let pid_atom = pid_atom_cookie.get_reply().expect("Unable to retrieve _NET_WM_PID").atom();
 
-    let reply = xcb::get_property(&conn, false, window, pid_atom, xcb::ATOM_CARDINAL, 0, 1).get_reply().unwrap_or_else(|error| panic!("Unable to retrieve _NET_WM_PID from focused window {}: {}", window, error));
+    let reply = xcb::get_property(&conn, false, window, pid_atom, xcb::ATOM_CARDINAL, 0, 1)
+                    .get_reply()
+                    .unwrap_or_else(|error| panic!("Unable to retrieve _NET_WM_PID from focused window {}: {}", window, error));
     if reply.value_len() == 0 {
         eprintln!("Unable to retrieve _NET_WM_PID from focused window {}; trying WM_CLASS.", window);
         //TODO: what's a good size here?
-        let reply = xcb::get_property(&conn, false, window, xcb::ATOM_WM_CLASS, xcb::ATOM_STRING, 0, 64).get_reply().unwrap_or_else(|error| panic!("Unable to retrieve WM_CLASS from focused window {}: {}", window, error));
-        let class = std::string::String::from_utf8(reply.value().iter().cloned().take_while(|c| *c != 0u8).collect::<std::vec::Vec<_>>()).unwrap_or_else(|error| panic!("Unable to decode {:#?}: {}", reply.value() as &[u8], error));
+        let reply = xcb::get_property(&conn, false, window, xcb::ATOM_WM_CLASS, xcb::ATOM_STRING, 0, 64)
+                        .get_reply()
+                        .unwrap_or_else(|error| panic!("Unable to retrieve WM_CLASS from focused window {}: {}", window, error));
+        let class = String::from_utf8(reply.value().iter().cloned().take_while(|c| *c != 0u8).collect::<Vec<_>>())
+                           .unwrap_or_else(|error| panic!("Unable to decode {:#?}: {}", reply.value() as &[u8], error));
         //TODO: find processes named 'class', compare cwds
         eprintln!("Unimplemented: Find processes named {}", class);
         return None;
@@ -87,17 +94,17 @@ fn get_focused_window_pid() -> std::option::Option<u32> {
 }
 
 enum Cwd {
-    Regular(std::string::String),
-    Priority(std::string::String),
+    Regular(String),
+    Priority(String),
 }
 
 impl Cwd {
-    fn new<Str: std::convert::AsRef<str> + std::cmp::PartialEq<str>>(cwd: std::string::String, exe: &str, priority_commands: &[Str]) -> Self {
+    fn new<Str: PartialEq<str>>(cwd: String, exe: &str, priority_commands: &[Str]) -> Self {
         if priority_commands.iter().any(|elem| elem == exe) { Cwd::Priority(cwd) } else { Cwd::Regular(cwd) }
     }
 }
 
-impl<'a> std::convert::Into<&'a str> for &'a Cwd {
+impl<'a> Into<&'a str> for &'a Cwd {
     fn into(self) -> &'a str {
         match self {
             Cwd::Regular(cwd) => cwd,
@@ -112,20 +119,21 @@ impl std::fmt::Display for Cwd {
     }
 }
 
-fn get_child_cwd<Str: std::convert::AsRef<str> + std::cmp::PartialEq<str>>(pid: u32, priority_commands: &[Str]) -> Cwd {
+fn get_child_cwd<Str: PartialEq<str>>(pid: u32, priority_commands: &[Str]) -> Cwd {
     use std::io::Read;
 
     //find children
-    let mut children = std::string::String::new();
+    let mut children = String::new();
     //get cwd
     //FIXME: potential race
+    //       use openat?
     let exe = std::fs::read_link(format!("/proc/{}/exe", pid)).expect("Unable to read /proc/$PID/exe").to_str().unwrap().to_owned();
     let cwd = Cwd::new(std::fs::read_link(format!("/proc/{}/cwd", pid)).expect("Unable to read /proc/$PID/cwd").to_str().unwrap().into(), &exe, priority_commands);
     //FIXME: tid
     let tid = pid;
     std::fs::File::open(format!("/proc/{}/task/{}/children", pid, tid)).expect("Unable to read /proc/$PID/task/$PID/children").read_to_string(&mut children).unwrap();
     if children.is_empty() {
-        //no children, read cwd
+        //no children
         return cwd;
     }
     //get child cwd
@@ -136,18 +144,18 @@ fn get_child_cwd<Str: std::convert::AsRef<str> + std::cmp::PartialEq<str>>(pid: 
         eprintln!("Warning: Process {} has multiple children. Following {}.", pid, child);
     }
     let child_cwd = get_child_cwd(child.parse().unwrap(), priority_commands);
-    match child_cwd {
-        Cwd::Regular(_) => match cwd {
-            Cwd::Regular(_) => child_cwd,
-            Cwd::Priority(_) => cwd,
-        }
-        Cwd::Priority(_) => child_cwd,
+    match (&cwd, &child_cwd) {
+        //prefer child cwd
+        (_, Cwd::Priority(_)) => child_cwd,
+        (Cwd::Regular(_), Cwd::Regular(_)) => child_cwd,
+        //unless cwd is prioritized
+        (Cwd::Priority(_), Cwd::Regular(_)) => cwd,
     }
 }
 
 fn main() {
     match get_focused_window_pid() {
-        std::option::Option::Some(pid) => println!("{}", get_child_cwd(pid, &std::env::args().skip(1).collect::<std::vec::Vec<_>>())),
-        std::option::Option::None => println!("{}", dirs::home_dir().unwrap().to_str().unwrap()),
+        Some(pid) => println!("{}", get_child_cwd(pid, &std::env::args().skip(1).collect::<Vec<_>>())),
+        None => println!("{}", dirs::home_dir().unwrap().to_str().unwrap()),
     }
 }
