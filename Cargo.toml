@@ -5,6 +5,7 @@ authors = ["Alexander 'z33ky' Hirsch <1zeeky@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-xcb = "0.8.2"
 byteorder = "1"
 dirs = "1"
+openat = "0.1.17"
+xcb = "0.8.2"
