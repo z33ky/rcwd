@@ -4,6 +4,11 @@ version = "0.0.0"
 authors = ["Alexander 'z33ky' Hirsch <1zeeky@gmail.com>"]
 edition = "2018"
 
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+
 [dependencies]
 byteorder = "1"
 dirs = "1"
