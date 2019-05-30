@@ -161,8 +161,15 @@ fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_com
 }
 
 fn main() {
-    let cwd = get_focused_window_pid().and_then(|(proc, pid)| {
-        get_child_cwd(&proc, pid, &std::env::args().skip(1).collect::<Vec<_>>()).and_then(|cwd| cwd.into())
+    let cwd = get_proc_and_focused_window_pid().and_then(|(proc, pid)| {
+        get_child_cwd(&proc, pid, &std::env::args().skip(1).collect::<Vec<_>>()).and_then(|cwd| {
+            let cwd = cwd.into();
+            if !std::path::Path::new(&cwd).exists() {
+                //FIXME: attempt a different child or get the parent CWD
+                return Err(format!("{} does not exist anymore.", cwd));
+            }
+            Ok(cwd)
+        })
     }).unwrap_or_else(|error| {
         eprintln!("{}", error);
         dirs::home_dir().unwrap().into_os_string().into_string().unwrap()
