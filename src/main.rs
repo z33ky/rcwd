@@ -7,7 +7,16 @@ enum X11WmState {
     Iconic    = 3,
 }
 
-fn get_focused_window_pid() -> Result<u32, String> {
+//Getting a handle for /proc and the pid of the focused window seem like orthogonal tasks - and they are
+//however, we want to avoid having our view of /proc being inconsistent with the window's pid.
+//If we open /proc before we get the pid, but the program is started after we got our /proc-handle,
+//we won't find the process with our handle (or potentially worse, scan a program that just exited
+//and happened to have the same pid).
+//If we open /proc after we get the pid, the program might be closed before we get our proc-handle,
+//resulting in a similar unfortunate scenario.
+//Instead we open /proc after getting the window handle, but before getting its pid. I'm not sure
+//however if getting the pid actually does fail if we try it with a stale window handle.
+fn get_proc_and_focused_window_pid() -> Result<(openat::Dir, u32), String> {
     //FIXME: X11 endianess?
     use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -36,6 +45,9 @@ fn get_focused_window_pid() -> Result<u32, String> {
     if window == xcb::WINDOW_NONE {
         return Err("No window is focused".to_string());
     }
+
+    //open proc
+    let proc = openat::Dir::open("/proc").map_err(|error| format!("Unable to open /proc: {}", error))?;
 
     //check withdrawn state
     let state_atom = state_atom_cookie.get_reply().map_err(|error| format!("Unable to retrieve WM_STATE atom: {}.", error))?.atom();
@@ -80,7 +92,7 @@ fn get_focused_window_pid() -> Result<u32, String> {
     assert_eq!(reply.value_len(), 1);
     let mut raw = reply.value();
     assert_eq!(raw.len(), 4, "_NET_WM_PID property is expected to be at least 4 bytes");
-    Ok(raw.read_u32::<LittleEndian>().unwrap())
+    Ok((proc, raw.read_u32::<LittleEndian>().unwrap()))
 }
 
 enum Cwd {
@@ -149,14 +161,8 @@ fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_com
 }
 
 fn main() {
-    let cwd = get_focused_window_pid().and_then(|pid| {
-        //FIXME: race due to opening /proc after getting the focused window
-        //       we should open /proc after getting the window and before getting the pid
-        //       (assuming getting the pid will fail when the window suddenly is closed at that point)
-        match openat::Dir::open("/proc") {
-            Ok(proc) => get_child_cwd(&proc, pid, &std::env::args().skip(1).collect::<Vec<_>>()).map(|cwd| cwd.into()),
-            Err(error) => Err(format!("Warning: Unable to open /proc: {}", error)),
-        }
+    let cwd = get_focused_window_pid().and_then(|(proc, pid)| {
+        get_child_cwd(&proc, pid, &std::env::args().skip(1).collect::<Vec<_>>()).and_then(|cwd| cwd.into())
     }).unwrap_or_else(|error| {
         eprintln!("{}", error);
         dirs::home_dir().unwrap().into_os_string().into_string().unwrap()
