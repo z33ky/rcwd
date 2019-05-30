@@ -1,4 +1,5 @@
 #[allow(dead_code)]
+#[repr(u32)]
 enum X11WmState {
     Withdrawn = 0,
     Normal    = 1,
@@ -6,61 +7,51 @@ enum X11WmState {
     Iconic    = 3,
 }
 
-fn get_focused_window_pid() -> Option<u32> {
+fn get_focused_window_pid() -> Result<u32, String> {
     //FIXME: X11 endianess?
     use byteorder::{LittleEndian, ReadBytesExt};
 
-    let (conn, screen_num) = {
-        match xcb::Connection::connect(None) {
-            Err(error) => {
-                eprintln!("Unable to open X11 connection: {}", error);
-                return None;
-            }
-            Ok(result) => result,
-        }
-    };
+    let (conn, screen_num) = xcb::Connection::connect(None).map_err(|error| format!("Unable to open X11 connection: {}.", error))?;
 
     let active_window_atom_cookie = xcb::intern_atom(&conn, false, "_NET_ACTIVE_WINDOW");
     let pid_atom_cookie           = xcb::intern_atom(&conn, false, "_NET_WM_PID");
     let state_atom_cookie         = xcb::intern_atom(&conn, false, "WM_STATE");
 
     //get window
-    let root = conn.get_setup().roots().nth(screen_num as usize).expect("Unable to select current screen").root();
+    let root = conn.get_setup().roots().nth(screen_num as usize)
+                   .ok_or_else(|| "Unable to select current screen.".to_string())?.root();
 
-    let active_window_atom = active_window_atom_cookie.get_reply().expect("Unable to retrieve _NET_ACTIVE_WINDOW atom").atom();
+    let active_window_atom = active_window_atom_cookie.get_reply().map_err(|error| format!("Unable to retrieve _NET_ACTIVE_WINDOW atom: {}.", error))?.atom();
 
     let reply = xcb::get_property(&conn, false, root, active_window_atom, xcb::ATOM_WINDOW, 0, 1)
                     .get_reply()
-                    .expect("Unable to retrieve _NET_ACTIVE_WINDOW property from root");
+                    .map_err(|error| format!("Unable to retrieve _NET_ACTIVE_WINDOW property from root: {}.", error))?;
     if reply.value_len() == 0 {
-        eprintln!("Unable to retrieve _NET_ACTIVE_WINDOW property from root");
-        return None;
+        return Err("Unable to retrieve _NET_ACTIVE_WINDOW property from root.".to_string());
     }
     assert_eq!(reply.value_len(), 1);
     let mut raw = reply.value();
-    assert_eq!(raw.len(), 4, "_NET_ACTIVE_WINDOW property is expected to be at least 4 bytes");
+    assert_eq!(raw.len(), 4, "_NET_ACTIVE_WINDOW property is expected to be at least 4 bytes.");
     let window = raw.read_u32::<LittleEndian>().unwrap() as xcb::Window;
     if window == xcb::WINDOW_NONE {
-        eprintln!("No window is focused.");
-        return None;
+        return Err("No window is focused".to_string());
     }
 
     //check withdrawn state
-    let state_atom = state_atom_cookie.get_reply().expect("Unable to retrieve WM_STATE atom").atom();
+    let state_atom = state_atom_cookie.get_reply().map_err(|error| format!("Unable to retrieve WM_STATE atom: {}.", error))?.atom();
 
     match xcb::get_property(&conn, false, window, state_atom, state_atom, 0, 1).get_reply() {
         Ok(reply) => {
             if reply.value_len() == 0 {
-                eprintln!("Unable to retrieve WM_STATE from focused window {}", window);
+                eprintln!("Unable to retrieve WM_STATE from focused window {}.", window);
             }
             else {
                 assert_eq!(reply.value_len(), 1);
                 let mut raw = reply.value();
-                assert_eq!(raw.len(), 4, "WM_STATE property is expected to be at least 4 bytes");
+                assert_eq!(raw.len(), 4, "WM_STATE property is expected to be at least 4 bytes.");
                 let state = raw.read_u32::<LittleEndian>().unwrap();
                 if state != X11WmState::Normal as u32 {
-                    eprintln!("Focused window {} is not in normal (visible) state ({} != {}); Ignoring.", window, state, X11WmState::Normal as u32);
-                    return None;
+                    return Err(format!("Focused window {} is not in normal (visible) state ({} != {}); Ignoring.", window, state, X11WmState::Normal as u32));
                 }
             }
         }
@@ -70,7 +61,7 @@ fn get_focused_window_pid() -> Option<u32> {
     };
 
     //get pid
-    let pid_atom = pid_atom_cookie.get_reply().expect("Unable to retrieve _NET_WM_PID").atom();
+    let pid_atom = pid_atom_cookie.get_reply().map_err(|error| format!("Unable to retrieve _NET_WM_PID: {}.", error))?.atom();
 
     let reply = xcb::get_property(&conn, false, window, pid_atom, xcb::ATOM_CARDINAL, 0, 1)
                     .get_reply()
@@ -84,13 +75,12 @@ fn get_focused_window_pid() -> Option<u32> {
         let class = String::from_utf8(reply.value().iter().cloned().take_while(|c| *c != 0u8).collect::<Vec<_>>())
                            .unwrap_or_else(|error| panic!("Unable to decode {:#?}: {}", reply.value() as &[u8], error));
         //TODO: find processes named 'class', compare cwds
-        eprintln!("Unimplemented: Find processes named {}", class);
-        return None;
+        return Err(format!("Unimplemented: Find processes named {}", class));
     }
     assert_eq!(reply.value_len(), 1);
     let mut raw = reply.value();
     assert_eq!(raw.len(), 4, "_NET_WM_PID property is expected to be at least 4 bytes");
-    Some(raw.read_u32::<LittleEndian>().unwrap())
+    Ok(raw.read_u32::<LittleEndian>().unwrap())
 }
 
 enum Cwd {
@@ -104,8 +94,8 @@ impl Cwd {
     }
 }
 
-impl<'a> Into<&'a str> for &'a Cwd {
-    fn into(self) -> &'a str {
+impl<'a> Into<String> for Cwd {
+    fn into(self) -> String {
         match self {
             Cwd::Regular(cwd) => cwd,
             Cwd::Priority(cwd) => cwd,
@@ -113,50 +103,28 @@ impl<'a> Into<&'a str> for &'a Cwd {
     }
 }
 
-impl std::fmt::Display for Cwd {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(self.into())
-    }
-}
-
-fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_commands: &[Str]) -> Option<Cwd> {
+fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_commands: &[Str]) -> Result<Cwd, String> {
     use std::io::Read;
 
-    //find children
-    let mut children = String::new();
+    //find children...
     //get cwd
-    let exe = match proc.read_link(format!("{}/exe", pid)) {
-        Ok(exe) => exe.to_str().unwrap().to_owned(),
-        Err(error) => {
-            eprintln!("Unable to read /proc/{}/exe: {}.", pid, error);
-            return None;
-        },
-    };
-    let cwd = match proc.read_link(format!("{}/cwd", pid)) {
-        Ok(cwd) => Cwd::new(cwd.to_str().unwrap().to_owned(), &exe, priority_commands),
-        Err(error) => {
-            eprintln!("Unable to read /proc/{}/cwd: {}.", pid, error);
-            return None;
-        },
-    };
+    let exe = proc.read_link(format!("{}/exe", pid))
+                  .map_err(|error| format!("Unable to read /proc/{}/exe: {}.", pid, error))?
+                  .to_str().unwrap().to_owned();
+    let cwd = proc.read_link(format!("{}/cwd", pid))
+                  .map_err(|error| format!("Unable to read /proc/{}/cwd: {}.", pid, error))?
+                  .to_str().unwrap().to_owned();
+    let cwd = Cwd::new(cwd, &exe, priority_commands);
     //FIXME: tid
     let tid = pid;
-    match proc.open_file(format!("{}/task/{}/children", pid, tid)) {
-        Ok(mut file) => match file.read_to_string(&mut children) {
-            Ok(_) => (),
-            Err(error) => {
-                eprintln!("Unable to read from /proc/{}/task/{}/children: {}.", pid, tid, error);
-                return None;
-            },
-        },
-        Err(error) => {
-            eprintln!("Unable to read /proc/{}/task/{}/children: {}.", pid, tid, error);
-            return None;
-        },
-    }
+    let mut children = String::new();
+    proc.open_file(format!("{}/task/{}/children", pid, tid))
+        .map_err(|error| format!("Unable to open /proc/{}/task/{}/children: {}.", pid, tid, error))?
+        .read_to_string(&mut children)
+        .map_err(|error| format!("Unable to read from /proc/{}/task/{}/children: {}.", pid, tid, error))?;
     if children.is_empty() {
         //no children
-        return Some(cwd);
+        return Ok(cwd);
     }
 
     //get child cwd
@@ -166,23 +134,32 @@ fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_com
         //TODO: this isn't a problem if all children have the same cwd
         eprintln!("Warning: Process {} has multiple children. Following {}.", pid, child);
     }
-    let child_cwd = match get_child_cwd(proc, child.parse().unwrap(), priority_commands) {
-        Some(cwd) => cwd,
-        None => return Some(cwd),
-    };
-
-    Some(match (&cwd, &child_cwd) {
-        //prefer child cwd
-        (_, Cwd::Priority(_)) => child_cwd,
-        (Cwd::Regular(_), Cwd::Regular(_)) => child_cwd,
-        //unless cwd is prioritized
-        (Cwd::Priority(_), Cwd::Regular(_)) => cwd,
+    Ok(match get_child_cwd(proc, child.parse().unwrap(), priority_commands) {
+        Ok(child_cwd) => {
+            match (&cwd, &child_cwd) {
+                //prefer child cwd
+                (_, Cwd::Priority(_)) => child_cwd,
+                (Cwd::Regular(_), Cwd::Regular(_)) => child_cwd,
+                //unless cwd is prioritized
+                (Cwd::Priority(_), Cwd::Regular(_)) => cwd,
+            }
+        },
+        Err(_) => cwd,
     })
 }
 
 fn main() {
-    match get_focused_window_pid() {
-        Some(pid) => println!("{}", get_child_cwd(&openat::Dir::open("/proc").unwrap(), pid, &std::env::args().skip(1).collect::<Vec<_>>()).unwrap()),
-        None => println!("{}", dirs::home_dir().unwrap().to_str().unwrap()),
-    }
+    let cwd = get_focused_window_pid().and_then(|pid| {
+        //FIXME: race due to opening /proc after getting the focused window
+        //       we should open /proc after getting the window and before getting the pid
+        //       (assuming getting the pid will fail when the window suddenly is closed at that point)
+        match openat::Dir::open("/proc") {
+            Ok(proc) => get_child_cwd(&proc, pid, &std::env::args().skip(1).collect::<Vec<_>>()).map(|cwd| cwd.into()),
+            Err(error) => Err(format!("Warning: Unable to open /proc: {}", error)),
+        }
+    }).unwrap_or_else(|error| {
+        eprintln!("{}", error);
+        dirs::home_dir().unwrap().into_os_string().into_string().unwrap()
+    });
+    println!("{}", cwd);
 }
