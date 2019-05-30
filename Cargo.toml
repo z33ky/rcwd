@@ -11,6 +11,6 @@ panic = 'abort'
 
 [dependencies]
 byteorder = "1"
-dirs = "1"
+dirs = "2"
 openat = "0.1.17"
 xcb = "0.8.2"
