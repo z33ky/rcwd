@@ -104,9 +104,26 @@ impl Cwd {
     fn new<Str: PartialEq<str>>(cwd: String, exe: &str, priority_commands: &[Str]) -> Self {
         if priority_commands.iter().any(|elem| elem == exe) { Cwd::Priority(cwd) } else { Cwd::Regular(cwd) }
     }
+
+    fn exists_or_err(self) -> Result<Cwd, String> {
+        if std::path::Path::new(self.as_ref()).exists() {
+            Ok(self)
+        } else {
+            Err(format!("{} does not exist anymore.", self.as_ref()))
+        }
+    }
 }
 
-impl<'a> Into<String> for Cwd {
+impl AsRef<str> for Cwd {
+    fn as_ref(&self) -> &str {
+        match self {
+            Cwd::Regular(cwd) => cwd,
+            Cwd::Priority(cwd) => cwd,
+        }
+    }
+}
+
+impl Into<String> for Cwd {
     fn into(self) -> String {
         match self {
             Cwd::Regular(cwd) => cwd,
@@ -118,7 +135,6 @@ impl<'a> Into<String> for Cwd {
 fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_commands: &[Str]) -> Result<Cwd, String> {
     use std::io::Read;
 
-    //find children...
     //get cwd
     let exe = proc.read_link(format!("{}/exe", pid))
                   .map_err(|error| format!("Unable to read /proc/{}/exe: {}.", pid, error))?
@@ -127,6 +143,7 @@ fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_com
                   .map_err(|error| format!("Unable to read /proc/{}/cwd: {}.", pid, error))?
                   .to_str().unwrap().to_owned();
     let cwd = Cwd::new(cwd, &exe, priority_commands);
+    //find children
     //FIXME: tid
     let tid = pid;
     let mut children = String::new();
@@ -136,40 +153,68 @@ fn get_child_cwd<Str: PartialEq<str>>(proc: &openat::Dir, pid: u32, priority_com
         .map_err(|error| format!("Unable to read from /proc/{}/task/{}/children: {}.", pid, tid, error))?;
     if children.is_empty() {
         //no children
-        return Ok(cwd);
+        return cwd.exists_or_err();
     }
 
     //get child cwd
-    let mut children = children.split(' ');
-    let child = children.next().unwrap();
-    if children.next().is_some() {
-        //TODO: this isn't a problem if all children have the same cwd
-        eprintln!("Warning: Process {} has multiple children. Following {}.", pid, child);
-    }
-    Ok(match get_child_cwd(proc, child.parse().unwrap(), priority_commands) {
-        Ok(child_cwd) => {
-            match (&cwd, &child_cwd) {
-                //prefer child cwd
-                (_, Cwd::Priority(_)) => child_cwd,
-                (Cwd::Regular(_), Cwd::Regular(_)) => child_cwd,
-                //unless cwd is prioritized
-                (Cwd::Priority(_), Cwd::Regular(_)) => cwd,
+    debug_assert!(children == children.trim_start());
+    //make children an iterator of (pid, cwd) for every valid cwd
+    //"for every valid cwd" means that Cwd::exists_or_err() should return Ok(_)
+    let mut children = children.trim_end().split(' ').filter_map(|child| {
+        let pid = child.parse().unwrap();
+        get_child_cwd(proc, pid, priority_commands).ok().map(|cwd| (pid, cwd))
+    });
+    let child_cwd = if let Some((child_pid, child_cwd)) = children.next() {
+        let mut children = children.peekable();
+        if children.peek().is_some() {
+            //TODO: this isn't a problem if all children have the same cwd
+            eprintln!("Warning: Process {} has multiple children. Following {}.", pid, child_pid);
+        }
+        match child_cwd {
+            Cwd::Regular(_) => {
+                //try for a priority cwd in its place
+                //but if we don't find a priority command we continue with the non-prioritized child
+                children.map(|(_, cwd)| cwd).find(|cwd| match cwd {
+                    Cwd::Priority(_) => true,
+                    Cwd::Regular(_) => false,
+                }).unwrap_or(child_cwd)
+            }
+            //if it's already a priority command...
+            Cwd::Priority(_) => child_cwd,
+        }
+    } else {
+        //children have no valid cwd
+        return cwd.exists_or_err();
+    };
+    match (&cwd, &child_cwd) {
+        //return parent cwd if it has higher priority
+        (Cwd::Priority(_), Cwd::Regular(_)) => {
+            cwd.exists_or_err().or_else(|error| child_cwd.exists_or_err().map_err(|_| error))
+        }
+        //otherwise return child cwd
+        _ => {
+            if cfg!(debug_assertions) {
+                let child_cwd = child_cwd.exists_or_err();
+                assert!(child_cwd.is_ok());
+                child_cwd
+            } else {
+                Ok(child_cwd)
             }
         },
-        Err(_) => cwd,
-    })
+    }
 }
 
 fn main() {
     let cwd = get_proc_and_focused_window_pid().and_then(|(proc, pid)| {
         get_child_cwd(&proc, pid, &std::env::args().skip(1).collect::<Vec<_>>()).and_then(|cwd| {
-            let cwd = cwd.into();
-            if !std::path::Path::new(&cwd).exists() {
-                //FIXME: attempt a different child or get the parent CWD
-                return Err(format!("{} does not exist anymore.", cwd));
+            if cfg!(debug_assertions) {
+                let cwd = cwd.exists_or_err();
+                assert!(cwd.is_ok());
+                cwd
+            } else {
+                Ok(cwd)
             }
-            Ok(cwd)
-        })
+        }).map(|cwd| cwd.into())
     }).unwrap_or_else(|error| {
         eprintln!("{}", error);
         dirs::home_dir().unwrap().into_os_string().into_string().unwrap()
